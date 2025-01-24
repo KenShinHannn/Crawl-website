@@ -1,0 +1,9 @@
+[package]
+name = "test_saharat"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+spider = { version = "2.26.10", features = ["sitemap"] }
+spider_utils = { version = "2.26.12", features = ["transformations"] }
+tokio = { version = "1.43.0", features = ["full", "io-std"] }
