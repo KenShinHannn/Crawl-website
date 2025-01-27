@@ -5,7 +5,7 @@ use spider::hashbrown::HashMap;
 use spider::percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use spider::url::Url;
 use spider::website::Website;
-use spider::{reqwest, tokio, CaseInsensitiveString};
+use spider::{ reqwest, tokio, CaseInsensitiveString};
 use spider_utils::spider_transformations::transform_content;
 use spider_utils::spider_transformations::transformation::content::{
     ReturnFormat, TransformConfig,
@@ -15,48 +15,80 @@ use std::io::Write;
 use std::sync::Mutex;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
-type Cache = Mutex<HashMap<CaseInsensitiveString, String>>;
 
-async fn create_sitemap(cache: web::Data<Cache>) -> impl Responder {
-    let mut website: Website = Website::new("https://www.heygoody.com/");
-    website
-        .configuration
-        .with_respect_robots_txt(true)
-        .with_user_agent(Some("SpiderBot"))
-        .with_ignore_sitemap(false)
-        .with_sitemap(Some("/sitemap/sitemap-0.xml"))
-        .with_caching(true);
-    let start = Instant::now();
-    // crawl the sitemap first
-    println!("Starting crawl_sitemap...");
-    website.crawl_sitemap().await;
-    println!("Finished crawl_sitemap.");
-    // persist links to the next crawl
-    println!("Starting persist_links...");
-    website.persist_links();
-    println!("Finished persist_links.");
-    // crawl normal with links found in the sitemap extended.
-    println!("Starting crawl...");
-    website.crawl().await;
-    println!("Finished crawl.");
-    let links = website.get_all_links_visited().await;
-    let duration = start.elapsed();
+type Cache = Mutex<HashMap<String, String>>;
 
-    let mut response_body = String::from("Sitemap created successfully.\n\n");
-    response_body.push_str(&format!(
-        "Time elapsed: {:?} seconds for total pages: {}\n\n",
-        duration.as_secs_f64(),
-        links.len()
-    ));
+pub async fn create_sitemap(cache: web::Data<Cache>) -> (HttpResponse, Vec<String>) {
+    let url: &str = "https://www.heygoody.com/robots.txt";
+    let web_url = "https://www.heygoody.com";
 
+    let is_spa = detect_spa(web_url.as_ref()).await;
+
+    let mut website: Website = if is_spa {
+        let mut web_spa = Website::new(web_url.as_ref());
+        let parsed_url = Url::parse(web_url.as_ref()).ok().map(Box::new);
+        web_spa.configuration
+            .with_respect_robots_txt(true)  
+            .with_chrome_intercept(RequestInterceptConfiguration::new(true), &parsed_url)
+            .with_caching(true);
+        web_spa
+    } else {
+        let mut web_ssr = Website::new(web_url.as_ref());
+        web_ssr.configuration
+            .with_respect_robots_txt(true)
+            .with_user_agent(Some("SpiderBot")) 
+            .with_caching(true);
+        web_ssr
+    };
+    let start: Instant = Instant::now();
+
+    let response = reqwest::get(url).await.unwrap();
+    let body = response.text().await.unwrap();
+
+    let sitemaps: Vec<String> = body.lines()
+        .filter(|line| line.starts_with("Sitemap:"))
+        .map(|line| line.trim_start_matches("Sitemap:").trim().to_string())
+        .collect();
+    println!("sitemap {:?}", sitemaps);
+
+    let mut total_pages = 0;
+    let mut extracted_links: Vec<String> = Vec::new();
     let mut cache_lock = cache.lock().unwrap();
-    for link in links.iter() {
-        response_body.push_str(&format!("- {}\n", link.as_ref()));
-        cache_lock.insert(link.to_string().into(), "Crawled".to_string());
+
+    for link in &sitemaps {
+        let sitemap_url = Url::parse(link).unwrap();
+        let sitemap_path = sitemap_url.path().to_string();
+        println!("Processing sitemap path: {}", sitemap_path);
+
+        website.with_sitemap(Some(&sitemap_path));
+        website.crawl_sitemap().await;
+
+        let website_links: spider::hashbrown::HashSet<CaseInsensitiveString> = website.get_links();
+        total_pages += website_links.len();
+
+        for link in &website_links {
+            let link_str = link.to_string();
+            extracted_links.push(link_str.clone());
+            cache_lock.insert("Crawled".to_string(), link_str);
+        }
     }
 
-    HttpResponse::Ok().body(response_body)
+    let duration = start.elapsed();
+    let response_body = format!(
+        "Sitemap created successfully.\n\nTime elapsed: {:.6} seconds for total pages: {}\n",
+        duration.as_secs_f64(),
+        total_pages
+    );
+
+    println!(
+        "Time elapsed in website crawl: {:?} for total pages: {}",
+        duration,
+        total_pages
+    );
+
+    (HttpResponse::Ok().body(response_body), extracted_links)
 }
+
 
 //detect spa
 async fn detect_spa(url: &str) -> bool {
@@ -70,51 +102,29 @@ async fn html_to_markdown(cache: web::Data<Cache>) -> impl Responder {
     println!("create target/downloads directory");
     std::fs::create_dir_all("./target/downloads").unwrap_or_default();
 
-    let mut website: Website = Website::new("https://www.heygoody.com/");
-    website.configuration.with_caching(true);
+    let (_response, sitemap_links) = create_sitemap(cache.clone()).await;
 
-    println!("Starting crawl_sitemap...");
-    website.crawl_sitemap().await;
-    website.persist_links();
-    website.crawl().await;
-    println!("Finished crawl_sitemap.");
-
-    let links = website.get_all_links_visited().await;
     let mut conf = TransformConfig::default();
     conf.return_format = ReturnFormat::Markdown;
 
-    // cache
     let mut cache_lock = cache.lock().unwrap();
 
-    for link in links.iter() {
-        let link_ci = CaseInsensitiveString::from(link.as_ref());
+    for link in sitemap_links.iter() {
 
-        if cache_lock.contains_key(&link_ci) {
+        if cache_lock.contains_key(&link.to_string()) {
             println!("Skipping cached link: {}", link);
             continue;
         }
-        cache_lock.insert(link_ci, "Crawled".to_string());
+        cache_lock.insert(link.to_string(), "Crawled".to_string());
 
-        let is_spa = detect_spa(link.as_ref()).await;
-
-        let mut web = if is_spa {
-            let mut web_spa = Website::new(link.as_ref());
-            let parsed_url = Url::parse(link.as_ref()).ok().map(Box::new);
-            web_spa.configuration.with_chrome_intercept(RequestInterceptConfiguration::new(true), &parsed_url);
-            web_spa
-        } else {
-            let mut web_ssr = Website::new(link.as_ref());
-            web_ssr.configuration.with_user_agent(Some("SpiderBot"));
-            web_ssr
-        };
-
+        let mut website = Website::new(link.as_ref());
         let mut rx2: tokio::sync::broadcast::Receiver<spider::page::Page> =
-            web.subscribe(0).unwrap();
+            website.subscribe(0).unwrap();
 
         let mut stdout: tokio::io::Stdout = tokio::io::stdout();
 
         // download file
-        let download_file = percent_encode(link.as_ref().as_bytes(), NON_ALPHANUMERIC).to_string();
+        let download_file = percent_encode(link.as_bytes(), NON_ALPHANUMERIC).to_string();
         let download_file = format!("./target/downloads/{}.md", download_file);
         let mut file = OpenOptions::new()
             .write(true)
@@ -137,8 +147,8 @@ async fn html_to_markdown(cache: web::Data<Cache>) -> impl Responder {
 
         let start = std::time::Instant::now();
 
-        // เลือกวิธีการ crawl ที่เหมาะสม
-        web.crawl().await;
+        website.crawl().await;
+        website.unsubscribe();
 
         let duration = start.elapsed();
         let mut stdout = join_handle.await.unwrap();
@@ -148,13 +158,13 @@ async fn html_to_markdown(cache: web::Data<Cache>) -> impl Responder {
                 format!(
                     "Time elapsed in website.crawl() is: {:?} for total pages: {:?}",
                     duration,
-                    web.get_size().await
+                    website.get_size().await
                 )
                 .as_bytes(),
             )
             .await;
-    }
-
+    
+}
     HttpResponse::Ok().body("HTML to Markdown conversion completed successfully.")
 }
 
@@ -170,8 +180,8 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
-            .app_data(cache_data.clone()) // เพิ่ม Cache เข้าไปในแอป
-            .route("/create-sitemap", web::get().to(create_sitemap))
+            .app_data(cache_data.clone()) 
+            // .route("/create-sitemap", web::get().to(create_sitemap))
             .route("/html_to_markdown", web::get().to(html_to_markdown))
     })
     .bind("127.0.0.1:8080")?

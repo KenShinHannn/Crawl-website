@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-spider = { version = "2.26.10", features = ["sitemap"] }
+actix-web = "4.9.0"
+env_logger = "0.11.6"
+http-cache-reqwest = "0.15.0"
+spider = { version = "2.26.10", features = ["sitemap","cache_request", "cache"] }
 spider_utils = { version = "2.26.12", features = ["transformations"] }
 tokio = { version = "1.43.0", features = ["full", "io-std"] }
