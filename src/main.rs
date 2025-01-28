@@ -1,7 +1,8 @@
 extern crate spider;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use ::futures::future::join_all;
 use spider::features::chrome_common::RequestInterceptConfiguration;
-use spider::hashbrown::HashMap;
+use spider::hashbrown::{HashMap, HashSet};
 use spider::percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use spider::url::Url;
 use spider::website::Website;
@@ -10,70 +11,100 @@ use spider_utils::spider_transformations::transform_content;
 use spider_utils::spider_transformations::transformation::content::{
     ReturnFormat, TransformConfig,
 };
+use tokio::task::futures;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
-
 type Cache = Mutex<HashMap<String, String>>;
 
-pub async fn create_sitemap(cache: web::Data<Cache>) -> (HttpResponse, Vec<String>) {
-    let url: &str = "https://www.heygoody.com/robots.txt";
+pub(crate) fn spawn_task<F>(_task_name: &str, future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::task::spawn(future)
+}
+pub async fn create_sitemap() -> (HttpResponse, Vec<String>) {
     let web_url = "https://www.heygoody.com";
+    let is_spa = detect_spa(web_url).await;
 
-    let is_spa = detect_spa(web_url.as_ref()).await;
-
-    let mut website: Website = if is_spa {
-        let mut web_spa = Website::new(web_url.as_ref());
-        let parsed_url = Url::parse(web_url.as_ref()).ok().map(Box::new);
+    let website = if is_spa {
+        let mut web_spa = Website::new(web_url);
+        let parsed_url = Url::parse(web_url).ok().map(Box::new);
         web_spa.configuration
-            .with_respect_robots_txt(true)  
+            .with_respect_robots_txt(true)
             .with_chrome_intercept(RequestInterceptConfiguration::new(true), &parsed_url)
             .with_caching(true);
         web_spa
     } else {
-        let mut web_ssr = Website::new(web_url.as_ref());
+        let mut web_ssr = Website::new(web_url);
         web_ssr.configuration
             .with_respect_robots_txt(true)
-            .with_user_agent(Some("SpiderBot")) 
+            .with_user_agent(Some("SpiderBot"))
             .with_caching(true);
         web_ssr
     };
-    let start: Instant = Instant::now();
 
-    let response = reqwest::get(url).await.unwrap();
-    let body = response.text().await.unwrap();
+    let start = Instant::now();
 
-    let sitemaps: Vec<String> = body.lines()
-        .filter(|line| line.starts_with("Sitemap:"))
-        .map(|line| line.trim_start_matches("Sitemap:").trim().to_string())
-        .collect();
-    println!("sitemap {:?}", sitemaps);
+    let sitemap_links = vec![
+        "/sitemap.xml",
+        "/th/sitemap_index.xml",
+        "/th/post-sitemap.xml",
+        "/th/page-sitemap.xml",
+        "/th/post-sitemap1.xml",
+        "/th/post-sitemap2.xml",
+        "/th/local-sitemap.xml",
+    ];
+
+    let mut tasks = vec![];
+    let mut extracted_links = vec![];
+
+    for link in sitemap_links {
+        let link = link.to_string();
+        let mut website_clone = website.clone();
+        let task_start = Instant::now();
+
+        tasks.push(spawn_task("sitemap_crawl_task", async move {
+            println!("Task started for link: {} at {:?}", link, task_start);
+
+            website_clone.with_sitemap(Some(&link));
+            website_clone.crawl_sitemap().await;
+
+            let website_links: HashSet<CaseInsensitiveString> = website_clone.get_links();
+            let mut link_vec = vec![];
+
+            for extracted_link in &website_links {
+                println!("Extracted link from {}: {}", link, extracted_link);
+                link_vec.push(extracted_link.to_string());
+            }
+
+            println!(
+                "Task completed for link: {} with {} links in {:.6} seconds",
+                link,
+                link_vec.len(),
+                task_start.elapsed().as_secs_f64()
+            );
+
+            link_vec // ส่งกลับ Vec<String> ของลิงก์ที่ดึงได้
+        }));
+    }
 
     let mut total_pages = 0;
-    let mut extracted_links: Vec<String> = Vec::new();
-    let mut cache_lock = cache.lock().unwrap();
 
-    for link in &sitemaps {
-        let sitemap_url = Url::parse(link).unwrap();
-        let sitemap_path = sitemap_url.path().to_string();
-        println!("Processing sitemap path: {}", sitemap_path);
-
-        website.with_sitemap(Some(&sitemap_path));
-        website.crawl_sitemap().await;
-
-        let website_links: spider::hashbrown::HashSet<CaseInsensitiveString> = website.get_links();
-        total_pages += website_links.len();
-
-        for link in &website_links {
-            let link_str = link.to_string();
-            extracted_links.push(link_str.clone());
-            cache_lock.insert("Crawled".to_string(), link_str);
+    // รอผลลัพธ์ของแต่ละ Task
+    for task in tasks {
+        if let Ok(links) = task.await {
+            println!("Task completed with {} links", links.len());
+            total_pages += links.len();
+            extracted_links.extend(links);
         }
     }
 
     let duration = start.elapsed();
+
     let response_body = format!(
         "Sitemap created successfully.\n\nTime elapsed: {:.6} seconds for total pages: {}\n",
         duration.as_secs_f64(),
@@ -89,84 +120,69 @@ pub async fn create_sitemap(cache: web::Data<Cache>) -> (HttpResponse, Vec<Strin
     (HttpResponse::Ok().body(response_body), extracted_links)
 }
 
-
 //detect spa
 async fn detect_spa(url: &str) -> bool {
-    let response = reqwest::get(url).await.unwrap();
+    let response = spider::reqwest::get(url).await.unwrap();
     let body = response.text().await.unwrap();
     //detect html content
     body.contains("<script>") || body.contains("fetch(") || body.contains("window.onload")
 }
 
-async fn html_to_markdown(cache: web::Data<Cache>) -> impl Responder {
-    println!("create target/downloads directory");
+async fn html_to_markdown() -> impl Responder {
+    println!("Creating target/downloads directory...");
     std::fs::create_dir_all("./target/downloads").unwrap_or_default();
 
-    let (_response, sitemap_links) = create_sitemap(cache.clone()).await;
+    let (_response, sitemap_links) = create_sitemap().await;
 
     let mut conf = TransformConfig::default();
     conf.return_format = ReturnFormat::Markdown;
 
-    let mut cache_lock = cache.lock().unwrap();
+    let mut tasks = vec![];
 
     for link in sitemap_links.iter() {
+        let link = link.to_string();
+        let conf = conf.clone();
 
-        if cache_lock.contains_key(&link.to_string()) {
-            println!("Skipping cached link: {}", link);
-            continue;
-        }
-        cache_lock.insert(link.to_string(), "Crawled".to_string());
+        let task = spawn_task("markdown_conversion_task", async move {
+            let task_start = Instant::now();
+            println!("Task html_to_markdown started for link: {} at {:?}", link, task_start);
+            let mut website = Website::new(&link);
+            let mut rx2 = website.subscribe(0).unwrap();
 
-        let mut website = Website::new(link.as_ref());
-        let mut rx2: tokio::sync::broadcast::Receiver<spider::page::Page> =
-            website.subscribe(0).unwrap();
+            let download_file = percent_encode(link.as_bytes(), NON_ALPHANUMERIC).to_string();
+            let download_file = format!("./target/downloads/{}.md", download_file);
 
-        let mut stdout: tokio::io::Stdout = tokio::io::stdout();
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&download_file)
+                .expect("Unable to open file");
 
-        // download file
-        let download_file = percent_encode(link.as_bytes(), NON_ALPHANUMERIC).to_string();
-        let download_file = format!("./target/downloads/{}.md", download_file);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&download_file)
-            .expect("Unable to open file");
+            let join_handle = tokio::spawn(async move {
+                while let Ok(res) = rx2.recv().await {
+                    let markup = transform_content(&res, &conf, &None, &None, &None);
+                    file.write_all(format!("- {}\n{}\n", res.get_url(), markup).as_bytes())
+                        .unwrap_or_default();
+                }
+            });
 
-        let join_handle = tokio::spawn(async move {
-            while let Ok(res) = rx2.recv().await {
-                let markup = transform_content(&res, &conf, &None, &None, &None);
-                file.write_all(format!("- {}\n{}\n", res.get_url(), markup).as_bytes())
-                    .unwrap_or_default();
-                let _ = stdout
-                    .write_all(format!("- {}\n {}\n", res.get_url(), markup).as_bytes())
-                    .await;
-            }
-            stdout
+            // wait for the task to complete
+            join_handle.await.unwrap();
+            website.crawl().await;
+            website.unsubscribe();
+
         });
 
-        let start = std::time::Instant::now();
+        tasks.push(task);
+    }
 
-        website.crawl().await;
-        website.unsubscribe();
+    // wait for all tasks to complete
+    join_all(tasks).await;
 
-        let duration = start.elapsed();
-        let mut stdout = join_handle.await.unwrap();
-
-        let _ = stdout
-            .write_all(
-                format!(
-                    "Time elapsed in website.crawl() is: {:?} for total pages: {:?}",
-                    duration,
-                    website.get_size().await
-                )
-                .as_bytes(),
-            )
-            .await;
-    
-}
     HttpResponse::Ok().body("HTML to Markdown conversion completed successfully.")
 }
+
 
 
 
